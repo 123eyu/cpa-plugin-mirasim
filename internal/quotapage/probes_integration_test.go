@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -41,6 +42,14 @@ func (f *probeRelayFixture) Do(_ context.Context, req pluginapi.HTTPRequest) (pl
 		if err := json.Unmarshal(req.Body, &payload); err != nil {
 			return pluginapi.HTTPResponse{}, err
 		}
+		if strings.HasPrefix(payload.Model, "claude-") {
+			if err := validateClaudeProbe(req); err != nil {
+				return pluginapi.HTTPResponse{StatusCode: http.StatusForbidden, Body: []byte(`{"error":{"message":"this client is not supported; use the mirasim client or Claude Code","type":"permission_error"},"type":"error"}`)}, nil
+			}
+			if parsed.Query().Get("beta") != "true" {
+				return pluginapi.HTTPResponse{}, fmt.Errorf("Claude probe lost its beta route")
+			}
+		}
 		f.inferences[payload.Model]++
 		switch parsed.Path {
 		case "/v1/messages":
@@ -54,6 +63,17 @@ func (f *probeRelayFixture) Do(_ context.Context, req pluginapi.HTTPRequest) (pl
 		return pluginapi.HTTPResponse{}, fmt.Errorf("unexpected route %s", parsed.Path)
 	}
 	return pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(body)}, nil
+}
+
+func TestProbeRelayRefusesBareClaudeMessages(t *testing.T) {
+	relay := &probeRelayFixture{inferences: make(map[string]int)}
+	response, err := relay.Do(context.Background(), pluginapi.HTTPRequest{
+		URL: "https://relay.example/v1/messages", Headers: http.Header{"Content-Type": {"application/json"}},
+		Body: []byte(`{"model":"claude-opus-5-5","messages":[{"role":"user","content":"Reply with OK."}],"max_tokens":32,"stream":false}`),
+	})
+	if err != nil || response.StatusCode != http.StatusForbidden || !strings.Contains(string(response.Body), "this client is not supported") || len(relay.inferences) != 0 {
+		t.Fatalf("bare probe did not reproduce the client refusal: %+v, %v", response, err)
+	}
 }
 
 func (f *probeRelayFixture) DoStream(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error) {

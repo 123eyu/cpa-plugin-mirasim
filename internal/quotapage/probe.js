@@ -8,7 +8,7 @@
   const table = document.getElementById('probe-table');
   let running = false;
   let stopping = false;
-  const labels = { pending: '等待测试', running: '测试中', available: '可用', unavailable: '不可用', empty: '空响应', cancelled: '结果未知', skipped: '未测试' };
+  const labels = { pending: '等待测试', running: '测试中', available: '可用', unavailable: '不可用', client_rejected: '客户端受限', empty: '空响应', cancelled: '结果未知', skipped: '未测试' };
 
   async function request(action, ticket) {
     const url = new URL(window.location.href);
@@ -130,6 +130,7 @@
       summary.textContent = tasks.length === 0 ? '没有可测试的模型。' :
         (stopping ? '已停止' : '测试完成') + ' · ' + completed + '/' + tasks.length +
         ' · 可用 ' + count('available') + ' · 不可用 ' + count('unavailable') +
+        ' · 客户端受限 ' + count('client_rejected') +
         ' · 空响应 ' + count('empty') + ' · 结果未知 ' + count('cancelled');
     } catch (error) {
       summary.textContent = error.message || '读取模型列表失败。';

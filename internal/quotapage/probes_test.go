@@ -212,6 +212,33 @@ func TestProbeFailureIsRedactedAndNextModelStillRuns(t *testing.T) {
 	}
 }
 
+func TestProbeDistinguishesClientRefusalFromModelPermission(t *testing.T) {
+	for _, test := range []struct {
+		message string
+		status  string
+	}{
+		{"this client is not supported; use the mirasim client or Claude Code", "client_rejected"},
+		{"this account cannot use this model", "unavailable"},
+	} {
+		t.Run(test.status, func(t *testing.T) {
+			page, host, _, executor := probeFixture()
+			row := prepareFixtureProbes(t, page, host)[0]
+			executor.execute = func(pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+				body, _ := json.Marshal(map[string]any{"error": map[string]string{"type": "permission_error", "message": test.message}})
+				return pluginapi.ExecutorResponse{}, mirasim.NewStatusError(http.StatusForbidden, body, nil)
+			}
+			response := mustServe(t, page, probeRequest(page, "probe", row.Ticket), host)
+			var result probeResult
+			if err := json.Unmarshal(response.Body, &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.Status != test.status || result.HTTPStatus != http.StatusForbidden || !strings.Contains(result.Response, test.message) {
+				t.Fatalf("incorrect refusal result: %+v", result)
+			}
+		})
+	}
+}
+
 func TestProbeSkipsDisabledAndOtherProviders(t *testing.T) {
 	page, host, _, executor := probeFixture()
 	host.entries = append([]pluginapi.HostAuthFileEntry{{ID: "other", AuthIndex: "other", Provider: "claude"}, {ID: "disabled", AuthIndex: "disabled", Provider: "mirasim", Disabled: true}}, host.entries...)

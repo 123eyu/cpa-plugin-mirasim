@@ -245,6 +245,10 @@ func (p *Page) executeProbe(ctx context.Context, ticket *probeTicket, host HostS
 			result.Status = "cancelled"
 		}
 		result.Response = safeProbeText(err.Error(), auth.JSON)
+		if result.HTTPStatus == http.StatusForbidden && strings.Contains(strings.ToLower(err.Error()), "this client is not supported; use the mirasim client or claude code") {
+			result.Status = "client_rejected"
+			result.Response = "上游拒绝了测试请求的客户端身份，本次无法确认模型是否可用。\n" + result.Response
+		}
 		return result
 	}
 	result.HTTPStatus = http.StatusOK
@@ -254,10 +258,9 @@ func (p *Page) executeProbe(ctx context.Context, ticket *probeTicket, host HostS
 }
 
 func minimalProbeRequest(model, kind string) pluginapi.ExecutorRequest {
-	// Inspect each relay's native response: the pinned CPA non-stream Claude
-	// translator expects SSE and would discard a normal Messages JSON body.
+	// Inspect each relay's native response without cross-protocol translation.
 	request := pluginapi.ExecutorRequest{Model: model, SourceFormat: "claude", Format: "claude", Headers: http.Header{"Content-Type": {"application/json"}}}
-	body := map[string]any{"model": model, "messages": []map[string]string{{"role": "user", "content": "Reply with OK."}}, "max_tokens": 32, "stream": false}
+	body := map[string]any{"model": model, "messages": []map[string]string{{"role": "user", "content": probePrompt}}, "max_tokens": 32, "stream": false}
 	if kind == "image" {
 		request.SourceFormat, request.Format = "openai-image", "openai-image"
 		request.Metadata = map[string]any{"request_path": "/v1/images/generations"}
@@ -265,8 +268,10 @@ func minimalProbeRequest(model, kind string) pluginapi.ExecutorRequest {
 	} else if strings.HasPrefix(strings.ToLower(model), "gpt-") {
 		request.SourceFormat, request.Format = "codex", "codex"
 		body = map[string]any{"model": model, "instructions": "", "store": false,
-			"input": []map[string]any{{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": "Reply with OK."}}}},
+			"input": []map[string]any{{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": probePrompt}}}},
 		}
+	} else if strings.HasPrefix(strings.ToLower(model), "claude-") {
+		applyClaudeProbeProfile(&request, body)
 	}
 	request.Payload, _ = json.Marshal(body)
 	request.OriginalRequest = append([]byte(nil), request.Payload...)
