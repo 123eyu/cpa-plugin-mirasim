@@ -144,10 +144,11 @@ type Client struct {
 	quota                 QuotaSnapshot
 	authProxyURL          string
 	now                   func() time.Time
+	queueWait             func(context.Context, time.Duration) error
 }
 
 func NewClient(storage credentials.Storage) *Client {
-	return &Client{storage: storage, now: time.Now}
+	return &Client{storage: storage, now: time.Now, queueWait: waitQueueRetry}
 }
 
 func (c *Client) Storage() credentials.Storage {
@@ -314,11 +315,17 @@ func (c *Client) do(ctx context.Context, client pluginapi.HostHTTPClient, method
 	if errURL != nil {
 		return pluginapi.HTTPResponse{}, errURL
 	}
-	for attempt := 0; attempt < 2; attempt++ {
-		authHeaders, errAuth := c.authHeaders(ctx, client, method, signaturePath, body, attempt > 0, controlPlane)
+	var queue queueRetryState
+	var authRetried, forceTicket bool
+	for {
+		if err := ctx.Err(); err != nil {
+			return pluginapi.HTTPResponse{}, err
+		}
+		authHeaders, errAuth := c.authHeaders(ctx, client, method, signaturePath, body, forceTicket, controlPlane)
 		if errAuth != nil {
 			return pluginapi.HTTPResponse{}, errAuth
 		}
+		forceTicket = false
 		outboundHeaders := prepareHeaders(headers, authHeaders, false)
 		for key, values := range providerHeaders {
 			outboundHeaders[http.CanonicalHeaderKey(key)] = append([]string(nil), values...)
@@ -334,14 +341,24 @@ func (c *Client) do(ctx context.Context, client pluginapi.HostHTTPClient, method
 			return pluginapi.HTTPResponse{}, errDo
 		}
 		c.observeQuota(resp.Headers)
-		if resp.StatusCode != http.StatusUnauthorized || attempt == 1 {
-			if resp.StatusCode == http.StatusUnauthorized {
+		if resp.StatusCode == http.StatusUnauthorized {
+			if authRetried {
 				c.markAccessRefreshRequired()
+				return resp, nil
 			}
-			return resp, nil
+			authRetried, forceTicket = true, true
+			continue
 		}
+		if !controlPlane && queueModelCall(method, requestPath) && queueRefused(resp.StatusCode, resp.Headers, resp.Body) {
+			if delay, hold := queue.next(c.nowTime(), resp.Headers); hold {
+				if err := c.queueWait(ctx, delay); err != nil {
+					return pluginapi.HTTPResponse{}, err
+				}
+				continue
+			}
+		}
+		return resp, nil
 	}
-	return pluginapi.HTTPResponse{}, fmt.Errorf("Mirasim request retry exhausted")
 }
 
 func (c *Client) DoStream(ctx context.Context, client pluginapi.HostHTTPClient, method, requestPath string, query url.Values, headers http.Header, body []byte) (pluginapi.HTTPStreamResponse, error) {
@@ -352,11 +369,17 @@ func (c *Client) DoStream(ctx context.Context, client pluginapi.HostHTTPClient, 
 	if errURL != nil {
 		return pluginapi.HTTPStreamResponse{}, errURL
 	}
-	for attempt := 0; attempt < 2; attempt++ {
-		authHeaders, errAuth := c.authHeaders(ctx, client, method, signaturePath, body, attempt > 0, false)
+	var queue queueRetryState
+	var authRetried, forceTicket bool
+	for {
+		if err := ctx.Err(); err != nil {
+			return pluginapi.HTTPStreamResponse{}, err
+		}
+		authHeaders, errAuth := c.authHeaders(ctx, client, method, signaturePath, body, forceTicket, false)
 		if errAuth != nil {
 			return pluginapi.HTTPStreamResponse{}, errAuth
 		}
+		forceTicket = false
 		outboundHeaders := prepareHeaders(headers, authHeaders, true)
 		resp, errDo := client.DoStream(ctx, pluginapi.HTTPRequest{
 			Method:      method,
@@ -369,15 +392,32 @@ func (c *Client) DoStream(ctx context.Context, client pluginapi.HostHTTPClient, 
 			return pluginapi.HTTPStreamResponse{}, errDo
 		}
 		c.observeQuota(resp.Headers)
-		if resp.StatusCode != http.StatusUnauthorized || attempt == 1 {
-			if resp.StatusCode == http.StatusUnauthorized {
+		if resp.StatusCode == http.StatusUnauthorized {
+			if authRetried {
 				c.markAccessRefreshRequired()
+				return resp, nil
 			}
-			return resp, nil
+			drainStream(ctx, resp.Chunks, maxErrorBody)
+			authRetried, forceTicket = true, true
+			continue
 		}
-		drainStream(ctx, resp.Chunks, maxErrorBody)
+		if queueModelCall(method, requestPath) && resp.StatusCode == http.StatusServiceUnavailable {
+			buffered, complete := readQueueResponse(ctx, resp.Chunks)
+			if err := ctx.Err(); err != nil {
+				return pluginapi.HTTPStreamResponse{}, err
+			}
+			if complete && queueRefused(resp.StatusCode, resp.Headers, buffered.Payload) {
+				if delay, hold := queue.next(c.nowTime(), resp.Headers); hold {
+					if err := c.queueWait(ctx, delay); err != nil {
+						return pluginapi.HTTPStreamResponse{}, err
+					}
+					continue
+				}
+			}
+			resp.Chunks = replayQueueResponse(ctx, buffered, resp.Chunks, complete)
+		}
+		return resp, nil
 	}
-	return pluginapi.HTTPStreamResponse{}, fmt.Errorf("Mirasim stream retry exhausted")
 }
 
 func (c *Client) ListModels(ctx context.Context, client pluginapi.HostHTTPClient) (Catalog, error) {

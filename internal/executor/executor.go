@@ -50,11 +50,19 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 	if errClient != nil {
 		return pluginapi.ExecutorResponse{}, errClient
 	}
-	requestBody, route, errBuild := buildProviderRequest(req, false, claudeShape(client, req.Model))
+	outputFormat := responseFormat(req)
+	// CPA's non-stream Messages translators aggregate SSE events. Request that
+	// wire format when translating, while native Messages clients keep JSON.
+	messagesSSE := selectWireFormat(req.Model, sourceFormat(req)) == sdktranslator.FormatClaude && outputFormat != "" && outputFormat != sdktranslator.FormatClaude
+	requestBody, route, errBuild := buildProviderRequest(req, messagesSSE, claudeShape(client, req.Model))
 	if errBuild != nil {
 		return pluginapi.ExecutorResponse{}, errBuild
 	}
-	resp, errDo := client.Do(ctx, req.HTTPClient, http.MethodPost, route.Path, route.Query, requestHeaders(req, route.Format), requestBody)
+	upstreamHeaders := requestHeaders(req, route.Format)
+	if messagesSSE {
+		upstreamHeaders.Set("Accept", "text/event-stream")
+	}
+	resp, errDo := client.Do(ctx, req.HTTPClient, http.MethodPost, route.Path, route.Query, upstreamHeaders, requestBody)
 	if errDo != nil {
 		return pluginapi.ExecutorResponse{}, errDo
 	}
@@ -68,7 +76,12 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 			return pluginapi.ExecutorResponse{}, errDo
 		}
 	}
-	outputFormat := responseFormat(req)
+	if messagesSSE {
+		upstreamPayload, errDo = messagesNonStreamPayload(upstreamPayload)
+		if errDo != nil {
+			return pluginapi.ExecutorResponse{}, errDo
+		}
+	}
 	payload, errTranslate := translateNonStream(ctx, route.Format, outputFormat, normalizeModel(req.Model), req.OriginalRequest, requestBody, upstreamPayload)
 	if errTranslate != nil {
 		return pluginapi.ExecutorResponse{}, errTranslate
